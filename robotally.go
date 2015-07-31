@@ -3,6 +3,8 @@
 package robotally
 
 import (
+	"crypto/hmac"
+	"crypto/sha1"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -37,6 +39,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to read request body", http.StatusInternalServerError)
 		return
 	}
+	// Validate the request against all configured secrets
+	valid := len(githubSecrets) == 0
+	for _, secret := range githubSecrets {
+		// Generate the desired checksum with the current secret
+		macer := hmac.New(sha1.New, secret)
+		macer.Write(body)
+		macer.Sum(nil)
+
+		// Compare it against the sent header
+		if header, ok := r.Header["X-Hub-Signature"]; ok {
+			checksum := strings.TrimPrefix(header[0], "sha1=")
+			if checksum == fmt.Sprintf("%x", macer.Sum(nil)) {
+				valid = true
+				break
+			}
+		}
+	}
+	if !valid {
+		http.Error(w, "Unauthorized request", http.StatusUnauthorized)
+		return
+	}
 	// Decode any GitHub event, and check for outside "opened" or "created" actions exclusively
 	e := new(Event)
 	if err := json.Unmarshal(body, e); err != nil {
@@ -46,8 +69,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if e.Sender.Login == githubUser {
 		return
 	}
-	if e.Action != "opened" && e.Action != "created" {
-		http.Error(w, "Non-supported action", http.StatusMethodNotAllowed)
+	if (e.Action != "opened" || e.PullRequest == nil) && (e.Action != "created" || e.Issue == nil) {
+		http.Error(w, "Unsupported method", http.StatusMethodNotAllowed)
 		return
 	}
 	// Create an authenticated GitHub client
@@ -60,19 +83,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	switch e.Action {
 	case "opened":
 		// A new issue or pull request was opened, add an empty status report to it
-		number := 0
-		if e.Issue != nil {
-			number = e.Issue.Number
-		} else if e.PullRequest != nil {
-			number = e.PullRequest.Number
-		}
-		// Make sure to also issue a warning if against master
 		warning := ""
-		if e.PullRequest != nil && e.PullRequest.Base.Branch == "master" {
+		if e.PullRequest.Base.Branch == "master" {
 			warning = "Pull request against `master`"
 		}
 		report := status(warning, nil, nil)
-		if _, _, err := client.Issues.CreateComment(e.Repository.Owner.Login, e.Repository.Name, number, &github.IssueComment{Body: &report}); err != nil {
+		if _, _, err := client.Issues.CreateComment(e.Repository.Owner.Login, e.Repository.Name, e.PullRequest.Number, &github.IssueComment{Body: &report}); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to comment on issue: %v", err), http.StatusInternalServerError)
 			return
 		}
